@@ -724,9 +724,10 @@ def render_single_track_concat(clips, output_dir, final_path, total_duration=Non
 
 def mix_dubbed_track(background_path, voice_path, final_path, center_removed):
     filter_graph = (
-        "[0:a]volume=0.65[bg];"
-        "[1:a]volume=1.0[voice];"
-        "[bg][voice]amix=inputs=2:duration=longest:dropout_transition=0,"
+        "[0:a]aformat=channel_layouts=stereo,volume=0.08[bg];"
+        "[1:a]aformat=channel_layouts=stereo,volume=4.0[voice];"
+        "[bg][voice]sidechaincompress=threshold=0.002:ratio=20:attack=5:release=450:makeup=1[ducked];"
+        "[ducked][voice]amix=inputs=2:duration=longest:dropout_transition=0:normalize=0,"
         "alimiter=limit=0.95[a]"
     )
     subprocess.run(

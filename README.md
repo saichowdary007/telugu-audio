@@ -121,7 +121,12 @@ That two-command flow covers the three offline phases:
   with the original background and writes `telugu_dub_track.m4a`.
 
 The final mix keeps the source audio as the background bed, converts it to
-stereo when needed, and overlays the Telugu speech timeline.
+stereo when needed, ducks it strongly whenever Telugu speech is active, and
+overlays the Telugu speech timeline. With mono source audio, English dialogue is
+part of the same mixed waveform as music/effects, so ffmpeg cannot perfectly
+remove it while preserving all background under dialogue. For cleaner background
+separation from a mono/stereo mix, use Demucs vocal/no-vocal separation and mix
+Telugu over the no-vocal stem.
 
 This local clustering is lightweight. It uses acoustic embeddings plus pitch,
 not actor names. Pitch is only used to choose adult male, adult female, or child
