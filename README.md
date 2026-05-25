@@ -49,6 +49,13 @@ This is pitch-based voice typing:
 That is useful for automatic voice selection, but it is not true linguistic
 dialect detection. Pitch alone cannot reliably identify a spoken dialect.
 
+If you only want to inspect the subtitle file and speaker assignment without
+generating every audio clip, add `--dry-run`:
+
+```bash
+python3 pipeline.py input.srt out --dry-run
+```
+
 ## Auto Sync Extension
 
 The extension does not need manual offset tuning. It mutes the webpage video and

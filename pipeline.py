@@ -24,18 +24,26 @@ BASE_RATE = {"adult_male": 152, "adult_female": 176, "child": 210, "elderly": 13
 
 
 def usage():
-    raise SystemExit("Usage: python3 pipeline.py input.srt output_dir [--media movie.mp4]")
+    raise SystemExit("Usage: python3 pipeline.py input.srt output_dir [--media movie.mp4] [--dry-run]")
 
 
 def parse_args(argv):
-    if len(argv) not in {3, 5}:
+    if len(argv) not in {3, 4, 5, 6}:
         usage()
     media = None
-    if len(argv) == 5:
-        if argv[3] != "--media":
+    dry_run = False
+    extra = argv[3:]
+    i = 0
+    while i < len(extra):
+        if extra[i] == "--media" and i + 1 < len(extra):
+            media = Path(extra[i + 1])
+            i += 2
+        elif extra[i] == "--dry-run":
+            dry_run = True
+            i += 1
+        else:
             usage()
-        media = Path(argv[4])
-    return Path(argv[1]), Path(argv[2]), media
+    return Path(argv[1]), Path(argv[2]), media, dry_run
 
 
 def seconds(parts):
@@ -49,17 +57,23 @@ def parse_srt(path):
         return []
 
     items = []
+    pending = None
     for block in re.split(r"\n\s*\n", raw):
         lines = [line.strip() for line in block.splitlines() if line.strip()]
         if len(lines) < 2:
+            if pending and lines:
+                pending["text"] = f"{pending['text']} {' '.join(lines)}".strip()
+            elif pending and not lines:
+                continue
             continue
         time_line = lines[1] if lines[0].isdigit() and len(lines) > 1 else lines[0]
         text_lines = lines[2:] if lines[0].isdigit() else lines[1:]
         match = TIME_RE.search(time_line)
-        if not match:
-            continue
         text = re.sub(r"<[^>]+>", "", " ".join(text_lines)).strip()
-        if text:
+        if match and text:
+            if pending:
+                items.append(pending)
+                pending = None
             items.append(
                 {
                     "start": seconds(match.groups()[:4]),
@@ -67,6 +81,16 @@ def parse_srt(path):
                     "text": text,
                 }
             )
+        elif match:
+            pending = {
+                "start": seconds(match.groups()[:4]),
+                "end": seconds(match.groups()[4:]),
+                "text": "",
+            }
+        elif text and pending:
+            pending["text"] = f"{pending['text']} {text}".strip()
+    if pending and pending["text"]:
+        items.append(pending)
     return items
 
 
@@ -92,10 +116,16 @@ def discover_telugu_voices():
 
 
 def extract_audio(media_path, wav_path):
-    subprocess.run(
-        ["ffmpeg", "-loglevel", "error", "-y", "-i", str(media_path), "-ac", "1", "-ar", "16000", "-vn", str(wav_path)],
-        check=True,
-    )
+    try:
+        subprocess.run(
+            ["ffmpeg", "-loglevel", "error", "-y", "-i", str(media_path), "-ac", "1", "-ar", "16000", "-vn", str(wav_path)],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return True
+    except subprocess.CalledProcessError:
+        return False
 
 
 def read_segment(reader, start, end):
@@ -274,7 +304,7 @@ def synthesize(text, profile, out_path):
 
 
 def main(argv):
-    input_path, output_dir, media_path = parse_args(argv)
+    input_path, output_dir, media_path, dry_run = parse_args(argv)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     subtitles = parse_srt(input_path)
@@ -301,8 +331,10 @@ def main(argv):
                 raise SystemExit(f"Media file not found: {media_path}")
             media_temp = tempfile.TemporaryDirectory()
             wav_path = Path(media_temp.name) / "source.wav"
-            extract_audio(media_path, wav_path)
-            media_reader = wave.open(str(wav_path), "rb")
+            if extract_audio(media_path, wav_path):
+                media_reader = wave.open(str(wav_path), "rb")
+            else:
+                print(f"warning: could not extract audio from {media_path}; falling back to subtitle-only speaker heuristics", file=sys.stderr)
 
         clips = []
         for index, subtitle in enumerate(subtitles, 1):
@@ -315,7 +347,8 @@ def main(argv):
                 features = {"pitch_hz": None, "speech_rate": round(len(re.findall(r"\w+", clean_text)) / max(0.1, subtitle["end"] - subtitle["start"]), 2), "bucket": fallback_type(clean_text) or "unknown"}
 
             filename = f"clip_{index:03d}.m4a"
-            synthesize(clean_text, state["speakers"][speaker_id], output_dir / filename)
+            if not dry_run:
+                synthesize(clean_text, state["speakers"][speaker_id], output_dir / filename)
             clips.append(
                 {
                     "start": subtitle["start"],
