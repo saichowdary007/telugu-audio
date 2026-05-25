@@ -24,13 +24,18 @@ BASE_RATE = {"adult_male": 152, "adult_female": 176, "child": 210, "elderly": 13
 
 
 def usage():
-    raise SystemExit("Usage: python3 pipeline.py input.srt output_dir [--media movie.mp4] [--dry-run]")
+    raise SystemExit(
+        "Usage: python3 pipeline.py input.srt output_dir [--media movie.mp4] "
+        "[--speaker-map line_speaker_map.json] [--speakers speakers.json] [--dry-run]"
+    )
 
 
 def parse_args(argv):
-    if len(argv) not in {3, 4, 5, 6}:
+    if len(argv) < 3:
         usage()
     media = None
+    speaker_map = None
+    speakers_path = None
     dry_run = False
     extra = argv[3:]
     i = 0
@@ -38,12 +43,18 @@ def parse_args(argv):
         if extra[i] == "--media" and i + 1 < len(extra):
             media = Path(extra[i + 1])
             i += 2
+        elif extra[i] == "--speaker-map" and i + 1 < len(extra):
+            speaker_map = Path(extra[i + 1])
+            i += 2
+        elif extra[i] == "--speakers" and i + 1 < len(extra):
+            speakers_path = Path(extra[i + 1])
+            i += 2
         elif extra[i] == "--dry-run":
             dry_run = True
             i += 1
         else:
             usage()
-    return Path(argv[1]), Path(argv[2]), media, dry_run
+    return Path(argv[1]), Path(argv[2]), media, speaker_map, speakers_path, dry_run
 
 
 def seconds(parts):
@@ -399,14 +410,25 @@ def render_single_track(clips, output_dir, final_path, total_duration=None):
     )
 
 
+def load_speaker_outputs(speaker_map_path, speakers_path):
+    if not speaker_map_path:
+        return None, None
+    line_map = json.loads(speaker_map_path.read_text(encoding="utf-8"))
+    speakers = {}
+    if speakers_path:
+        speakers = json.loads(speakers_path.read_text(encoding="utf-8"))
+    return {item["line_id"]: item for item in line_map}, speakers
+
+
 def main(argv):
-    input_path, output_dir, media_path, dry_run = parse_args(argv)
+    input_path, output_dir, media_path, speaker_map_path, speakers_path, dry_run = parse_args(argv)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     subtitles = parse_srt(input_path)
     if not subtitles:
         raise SystemExit(f"No subtitles found in {input_path}")
 
+    mapped_lines, mapped_speakers = load_speaker_outputs(speaker_map_path, speakers_path)
     state = {
         "speakers": {},
         "profiles": {},
@@ -418,6 +440,8 @@ def main(argv):
         "voices": discover_telugu_voices(),
         "voice_index": 0,
     }
+    if mapped_speakers:
+        state["speakers"].update(mapped_speakers)
 
     media_temp = None
     media_reader = None
@@ -440,7 +464,28 @@ def main(argv):
         clips = []
         for index, subtitle in enumerate(subtitles, 1):
             clean_text = subtitle["text"]
-            if media_reader is not None:
+            if mapped_lines and index in mapped_lines:
+                mapped = mapped_lines[index]
+                speaker_id = mapped["speaker_id"]
+                clean_text = mapped.get("text", clean_text)
+                if speaker_id not in state["speakers"]:
+                    state["speakers"][speaker_id] = {
+                        "label": speaker_id,
+                        "type": mapped.get("detected_type", "unknown"),
+                        "language_code": "te-IN",
+                        "voice_name": mapped.get("voice_name") or state["voices"][0],
+                        "rate": voice_rate(mapped.get("detected_type", "unknown"), 2.0, 0),
+                        "dialect_hint": mapped.get("detected_type", "unknown"),
+                    }
+                else:
+                    state["speakers"][speaker_id].setdefault("dialect_hint", state["speakers"][speaker_id].get("type", "unknown"))
+                    state["speakers"][speaker_id].setdefault("language_code", "te-IN")
+                features = {
+                    "pitch_hz": mapped.get("pitch_hz"),
+                    "speech_rate": round(len(re.findall(r"\w+", clean_text)) / max(0.1, subtitle["end"] - subtitle["start"]), 2),
+                    "bucket": mapped.get("detected_type", state["speakers"][speaker_id].get("type", "unknown")),
+                }
+            elif media_reader is not None:
                 features = analyze_subtitle(media_reader, clean_text, subtitle["start"], subtitle["end"])
                 speaker_id = choose_speaker_from_features(state, features, clean_text)
             else:
@@ -460,7 +505,7 @@ def main(argv):
                     "pitch_hz": features["pitch_hz"],
                     "speech_rate": features["speech_rate"],
                     "bucket": features["bucket"],
-                    "dialect_hint": state["speakers"][speaker_id]["dialect_hint"],
+                    "dialect_hint": state["speakers"][speaker_id].get("dialect_hint", features["bucket"]),
                 }
             )
             print(f"{filename}: {speaker_id} ({features['bucket']})")
@@ -474,9 +519,11 @@ def main(argv):
             encoding="utf-8",
         )
         final_path = output_dir / "single-track.m4a"
-        render_single_track(clips, output_dir, final_path, total_duration)
+        if not dry_run:
+            render_single_track(clips, output_dir, final_path, total_duration)
         print(f"Wrote {len(clips)} clips to {output_dir}")
-        print(f"Wrote single track to {final_path}")
+        if not dry_run:
+            print(f"Wrote single track to {final_path}")
     finally:
         if media_reader is not None:
             media_reader.close()

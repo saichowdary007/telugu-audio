@@ -24,6 +24,12 @@ out/
 The pipeline uses macOS `say` and `afconvert`, so there is no external TTS
 service, no API key, and no Python dependency install step.
 
+Install the one analysis dependency if it is not already present:
+
+```bash
+python3 -m pip install -r requirements.txt
+```
+
 Voice handling is simple by design:
 - It uses any Telugu voices installed on your Mac.
 - It assigns different speakers different local voice IDs when available.
@@ -36,21 +42,31 @@ Voice handling is simple by design:
 
 ### Automatic Speaker Detection
 
-If you also have the source movie or audio file, you can add `--media` and the
-script will use FFmpeg to extract the soundtrack, estimate pitch per subtitle
-interval, and cluster recurring speakers automatically:
+For stable speaker IDs, run the clustering step first. It extracts the center
+channel when available, builds a small acoustic embedding for each subtitle
+window, clusters similar voices, and writes `speakers.json` plus
+`line_speaker_map.json`:
+
+```bash
+python3 speaker_cluster.py input.srt movie_or_audio.mkv cluster-out
+```
+
+Then generate Telugu audio with the stable speaker map:
+
+```bash
+python3 pipeline.py input.srt out --speaker-map cluster-out/line_speaker_map.json --speakers cluster-out/speakers.json
+```
+
+This local clustering is lightweight. It uses acoustic embeddings plus pitch,
+not actor names. Pitch is only used to choose adult male, adult female, or child
+voice type.
+
+You can still pass `--media` directly to `pipeline.py`, but that path is the
+older pitch-only shortcut:
 
 ```bash
 python3 pipeline.py input.srt out --media movie.mp4
 ```
-
-This is pitch-based voice typing:
-- low pitch usually maps to a male voice bucket
-- mid pitch maps to a female voice bucket
-- high pitch maps to a child-like bucket
-
-That is useful for automatic voice selection, but it is not true linguistic
-dialect detection. Pitch alone cannot reliably identify a spoken dialect.
 
 If you only want to inspect the subtitle file and speaker assignment without
 generating every audio clip, add `--dry-run`:
