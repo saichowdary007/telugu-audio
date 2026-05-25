@@ -17,6 +17,7 @@ out/
   clip_001.m4a
   clip_002.m4a
   single-track.m4a
+  telugu_dub_track.m4a   # only when --media is provided
   sync.json
   speakers.json
 ```
@@ -39,6 +40,8 @@ Voice handling is simple by design:
   the file. Unnamed dialogue alternates automatically.
 - The pipeline also stitches a single `single-track.m4a` that follows the
   subtitle timeline, so you can listen to one file instead of many clips.
+- When `--media` is provided, it also writes `telugu_dub_track.m4a`, which
+  mixes the Telugu timeline voice over the original background.
 
 ### Automatic Speaker Detection
 
@@ -54,15 +57,27 @@ python3 speaker_cluster.py input.srt movie_or_audio.mkv cluster-out
 Then generate Telugu audio with the stable speaker map:
 
 ```bash
-python3 pipeline.py input.srt out --speaker-map cluster-out/line_speaker_map.json --speakers cluster-out/speakers.json
+python3 pipeline.py input.srt out --media movie_or_audio.mkv --speaker-map cluster-out/line_speaker_map.json --speakers cluster-out/speakers.json
 ```
+
+That two-command flow covers the three offline phases:
+- Phase 1: `speaker_cluster.py` creates stable `speaker_id` values from the
+  original audio and subtitle timings.
+- Phase 2: `pipeline.py` reuses the same local Telugu voice settings for each
+  `speaker_id` and writes the synced Telugu speech timeline.
+- Phase 3: when `--media` is passed, `pipeline.py` mixes that Telugu timeline
+  with the original background and writes `telugu_dub_track.m4a`.
+
+For 5.1 audio, the mix removes the center dialogue channel and keeps the
+background channels. For stereo audio, true center removal is not reliable, so
+the script falls back to a quieter stereo background.
 
 This local clustering is lightweight. It uses acoustic embeddings plus pitch,
 not actor names. Pitch is only used to choose adult male, adult female, or child
 voice type.
 
-You can still pass `--media` directly to `pipeline.py`, but that path is the
-older pitch-only shortcut:
+You can still pass `--media` directly to `pipeline.py`, but without the
+speaker map that path is the older pitch-only shortcut:
 
 ```bash
 python3 pipeline.py input.srt out --media movie.mp4

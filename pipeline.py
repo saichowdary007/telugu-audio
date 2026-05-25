@@ -410,6 +410,72 @@ def render_single_track(clips, output_dir, final_path, total_duration=None):
     )
 
 
+def extract_background_track(media_path, background_path):
+    # Prefer 5.1 sources: keep L/R/surround/LFE and drop the center dialogue channel.
+    centerless_pan = "pan=stereo|FL=0.50*FL+0.50*BL+0.25*LFE|FR=0.50*FR+0.50*BR+0.25*LFE"
+    base_cmd = ["ffmpeg", "-loglevel", "error", "-y", "-i", str(media_path), "-map", "0:a:0", "-vn"]
+    try:
+        subprocess.run(
+            base_cmd + ["-af", centerless_pan, "-c:a", "aac", "-b:a", "192k", str(background_path)],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return True
+    except subprocess.CalledProcessError:
+        subprocess.run(
+            base_cmd + ["-ac", "2", "-af", "volume=0.35", "-c:a", "aac", "-b:a", "192k", str(background_path)],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return False
+
+
+def mix_dubbed_track(background_path, voice_path, final_path, center_removed):
+    bg_volume = "0.65" if center_removed else "0.45"
+    filter_graph = (
+        f"[0:a]volume={bg_volume}[bg];"
+        "[1:a]volume=1.0[voice];"
+        "[bg][voice]amix=inputs=2:duration=longest:dropout_transition=0,"
+        "alimiter=limit=0.95[a]"
+    )
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            str(background_path),
+            "-i",
+            str(voice_path),
+            "-filter_complex",
+            filter_graph,
+            "-map",
+            "[a]",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-movflags",
+            "+faststart",
+            str(final_path),
+        ],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def render_dubbed_track(media_path, voice_path, output_dir):
+    background_path = output_dir / "_background.m4a"
+    final_path = output_dir / "telugu_dub_track.m4a"
+    center_removed = extract_background_track(media_path, background_path)
+    mix_dubbed_track(background_path, voice_path, final_path, center_removed)
+    return final_path, center_removed
+
+
 def load_speaker_outputs(speaker_map_path, speakers_path):
     if not speaker_map_path:
         return None, None
@@ -521,9 +587,15 @@ def main(argv):
         final_path = output_dir / "single-track.m4a"
         if not dry_run:
             render_single_track(clips, output_dir, final_path, total_duration)
+            if media_path is not None:
+                dubbed_path, center_removed = render_dubbed_track(media_path, final_path, output_dir)
+                if not center_removed:
+                    print("warning: source did not expose a 5.1 center channel; used quieter stereo background", file=sys.stderr)
         print(f"Wrote {len(clips)} clips to {output_dir}")
         if not dry_run:
             print(f"Wrote single track to {final_path}")
+            if media_path is not None:
+                print(f"Wrote dubbed track to {dubbed_path}")
     finally:
         if media_reader is not None:
             media_reader.close()
