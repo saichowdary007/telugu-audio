@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 import json
 import re
+import statistics
+import struct
 import subprocess
 import sys
 import tempfile
+import wave
 from pathlib import Path
 
 
@@ -17,12 +20,22 @@ MALE_WORDS = {"man", "men", "male", "boy", "father", "dad", "son", "brother", "h
 FEMALE_WORDS = {"woman", "women", "female", "girl", "mother", "mom", "daughter", "sister", "wife"}
 CHILD_WORDS = {"child", "kid", "baby", "children"}
 
-RATE_BY_TYPE = {
-    "adult_male": [148, 158, 138],
-    "adult_female": [174, 184, 164],
-    "child": [205, 220],
-    "elderly": [132, 142],
-}
+BASE_RATE = {"adult_male": 152, "adult_female": 176, "child": 210, "elderly": 138}
+
+
+def usage():
+    raise SystemExit("Usage: python3 pipeline.py input.srt output_dir [--media movie.mp4]")
+
+
+def parse_args(argv):
+    if len(argv) not in {3, 5}:
+        usage()
+    media = None
+    if len(argv) == 5:
+        if argv[3] != "--media":
+            usage()
+        media = Path(argv[4])
+    return Path(argv[1]), Path(argv[2]), media
 
 
 def seconds(parts):
@@ -40,15 +53,12 @@ def parse_srt(path):
         lines = [line.strip() for line in block.splitlines() if line.strip()]
         if len(lines) < 2:
             continue
-
         time_line = lines[1] if lines[0].isdigit() and len(lines) > 1 else lines[0]
         text_lines = lines[2:] if lines[0].isdigit() else lines[1:]
         match = TIME_RE.search(time_line)
         if not match:
             continue
-
-        text = " ".join(text_lines)
-        text = re.sub(r"<[^>]+>", "", text).strip()
+        text = re.sub(r"<[^>]+>", "", " ".join(text_lines)).strip()
         if text:
             items.append(
                 {
@@ -77,56 +87,177 @@ def guess_type(text):
 
 def discover_telugu_voices():
     proc = subprocess.run(["say", "-v", "?"], capture_output=True, text=True, check=True)
-    voices = []
-    for line in proc.stdout.splitlines():
-        match = VOICE_RE.match(line)
-        if match and match.group(2) == "te_IN":
-            voices.append(match.group(1).strip())
+    voices = [m.group(1).strip() for line in proc.stdout.splitlines() if (m := VOICE_RE.match(line)) and m.group(2) == "te_IN"]
     return voices or ["Geeta"]
 
 
-def speaker_for(text, state):
+def extract_audio(media_path, wav_path):
+    subprocess.run(
+        ["ffmpeg", "-loglevel", "error", "-y", "-i", str(media_path), "-ac", "1", "-ar", "16000", "-vn", str(wav_path)],
+        check=True,
+    )
+
+
+def read_segment(reader, start, end):
+    sr = reader.getframerate()
+    start_frame = max(0, int(start * sr))
+    end_frame = min(reader.getnframes(), int(end * sr))
+    if end_frame <= start_frame:
+        return [], sr
+    reader.setpos(start_frame)
+    raw = reader.readframes(end_frame - start_frame)
+    if not raw:
+        return [], sr
+    samples = struct.unpack("<{}h".format(len(raw) // 2), raw)
+    return samples, sr
+
+
+def estimate_pitch(samples, sr):
+    if len(samples) < sr // 5:
+        return None
+
+    frame_size = max(320, int(sr * 0.04))
+    hop = max(160, int(sr * 0.02))
+    min_lag = max(1, int(sr / 400))
+    max_lag = max(min_lag + 1, int(sr / 60))
+    voiced = []
+
+    for offset in range(0, len(samples) - frame_size + 1, hop):
+        frame = samples[offset : offset + frame_size]
+        mean = sum(frame) / len(frame)
+        centered = [x - mean for x in frame]
+        energy = sum(x * x for x in centered)
+        if energy < 1_000_000:
+            continue
+
+        best_lag = None
+        best_score = 0.0
+        for lag in range(min_lag, max_lag + 1):
+            score = 0.0
+            for i in range(len(centered) - lag):
+                score += centered[i] * centered[i + lag]
+            score /= energy
+            if score > best_score:
+                best_score = score
+                best_lag = lag
+
+        if best_lag and best_score > 0.25:
+            voiced.append(sr / best_lag)
+
+    return round(statistics.median(voiced), 1) if voiced else None
+
+
+def analyze_subtitle(reader, text, start, end):
+    samples, sr = read_segment(reader, start, end)
+    pitch = estimate_pitch(samples, sr)
+    words = len(re.findall(r"\w+", text))
+    duration = max(0.1, end - start)
+    speech_rate = round(words / duration, 2)
+    bucket = "unknown"
+    if pitch is not None:
+        if pitch < 110:
+            bucket = "adult_male"
+        elif pitch < 170:
+            bucket = "adult_female"
+        elif pitch < 225:
+            bucket = "child"
+        else:
+            bucket = "child"
+    return {"pitch_hz": pitch, "speech_rate": speech_rate, "bucket": bucket, "duration": round(duration, 3)}
+
+
+def fallback_type(text):
+    named = NAME_RE.match(text)
+    if named:
+        return guess_type(named.group(1)) or guess_type(named.group(2))
+    return guess_type(text)
+
+
+def choose_speaker_from_features(state, features, text):
+    if features["pitch_hz"] is None:
+        return choose_speaker_from_text(state, text)
+
+    best_id = None
+    best_score = 1e9
+    for speaker_id, profile in state["profiles"].items():
+        score = abs(profile["pitch_hz"] - features["pitch_hz"]) / 50
+        if profile["bucket"] != features["bucket"]:
+            score += 0.4
+        if score < best_score:
+            best_score = score
+            best_id = speaker_id
+
+    if best_id is None or best_score > 1.0:
+        return new_speaker(state, features)
+
+    update_profile(state, best_id, features)
+    return best_id
+
+
+def choose_speaker_from_text(state, text):
     named = NAME_RE.match(text)
     if named:
         key = normalize_name(named.group(1))
-        clean_text = named.group(2).strip()
-        speaker_type = guess_type(named.group(1)) or guess_type(clean_text)
+        clean = named.group(2).strip()
+        speaker_type = guess_type(named.group(1)) or guess_type(clean)
         if key not in state["by_name"]:
-            state["by_name"][key] = new_speaker(state, speaker_type)
-        return state["by_name"][key], clean_text
+            state["by_name"][key] = new_speaker(state, {"bucket": speaker_type or "unknown", "pitch_hz": None, "speech_rate": 1.0})
+        return state["by_name"][key], clean
 
     speaker_type = guess_type(text)
     if speaker_type:
         typed = state["by_type"].setdefault(speaker_type, [])
         if not typed:
-            typed.append(new_speaker(state, speaker_type))
+            typed.append(new_speaker(state, {"bucket": speaker_type, "pitch_hz": None, "speech_rate": 1.0}))
         return typed[0], text
 
     state["fallback_index"] = 1 - state["fallback_index"]
     speaker_type = "adult_male" if state["fallback_index"] == 0 else "adult_female"
     speaker_id = state["fallback"].get(speaker_type)
     if not speaker_id:
-        speaker_id = new_speaker(state, speaker_type)
+        speaker_id = new_speaker(state, {"bucket": speaker_type, "pitch_hz": None, "speech_rate": 1.0})
         state["fallback"][speaker_type] = speaker_id
     return speaker_id, text
 
 
-def new_speaker(state, speaker_type):
-    speaker_type = speaker_type or "adult_male"
+def voice_rate(bucket, speech_rate, index):
+    base = BASE_RATE.get(bucket, 160)
+    adjust = max(-18, min(18, int((speech_rate - 2.0) * 6)))
+    wobble = (index % 3 - 1) * 4
+    return max(120, min(240, base + adjust + wobble))
+
+
+def new_speaker(state, features):
     speaker_id = f"speaker_{len(state['speakers']) + 1:03d}"
+    bucket = features["bucket"]
+    idx = state["bucket_counts"].get(bucket, 0)
+    state["bucket_counts"][bucket] = idx + 1
     voice_name = state["voices"][state["voice_index"] % len(state["voices"])]
     state["voice_index"] += 1
-    type_index = state["type_counts"].get(speaker_type, 0)
-    state["type_counts"][speaker_type] = type_index + 1
-    rate = RATE_BY_TYPE.get(speaker_type, [160])[type_index % len(RATE_BY_TYPE.get(speaker_type, [160]))]
-    state["speakers"][speaker_id] = {
+    profile = {
         "label": speaker_id,
-        "type": speaker_type,
+        "type": bucket,
         "language_code": "te-IN",
         "voice_name": voice_name,
-        "rate": rate,
+        "rate": voice_rate(bucket, features["speech_rate"], idx),
+        "pitch_hz": features["pitch_hz"],
+        "speech_rate": features["speech_rate"],
+        "dialect_hint": {"adult_male": "low_pitch", "adult_female": "mid_pitch", "child": "high_pitch"}.get(bucket, "unknown"),
     }
+    state["speakers"][speaker_id] = profile
+    state["profiles"][speaker_id] = {"pitch_hz": features["pitch_hz"] or 0.0, "speech_rate": features["speech_rate"], "bucket": bucket}
     return speaker_id
+
+
+def update_profile(state, speaker_id, features):
+    profile = state["profiles"][speaker_id]
+    profile["pitch_hz"] = round((profile["pitch_hz"] + (features["pitch_hz"] or profile["pitch_hz"])) / 2, 1) if features["pitch_hz"] else profile["pitch_hz"]
+    profile["speech_rate"] = round((profile["speech_rate"] + features["speech_rate"]) / 2, 2)
+
+    speaker = state["speakers"][speaker_id]
+    speaker["pitch_hz"] = profile["pitch_hz"]
+    speaker["speech_rate"] = profile["speech_rate"]
+    speaker["rate"] = voice_rate(profile["bucket"], profile["speech_rate"], 0)
 
 
 def synthesize(text, profile, out_path):
@@ -143,11 +274,7 @@ def synthesize(text, profile, out_path):
 
 
 def main(argv):
-    if len(argv) != 3:
-        raise SystemExit("Usage: python3 pipeline.py input.srt output_dir")
-
-    input_path = Path(argv[1])
-    output_dir = Path(argv[2])
+    input_path, output_dir, media_path = parse_args(argv)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     subtitles = parse_srt(input_path)
@@ -156,40 +283,68 @@ def main(argv):
 
     state = {
         "speakers": {},
+        "profiles": {},
         "by_name": {},
         "by_type": {},
         "fallback": {},
         "fallback_index": 1,
-        "type_counts": {},
+        "bucket_counts": {},
         "voices": discover_telugu_voices(),
         "voice_index": 0,
     }
 
-    clips = []
-    for index, subtitle in enumerate(subtitles, 1):
-        speaker_id, clean_text = speaker_for(subtitle["text"], state)
-        filename = f"clip_{index:03d}.m4a"
-        synthesize(clean_text, state["speakers"][speaker_id], output_dir / filename)
-        clips.append(
-            {
-                "start": subtitle["start"],
-                "end": subtitle["end"],
-                "url": filename,
-                "speaker_id": speaker_id,
-                "text": clean_text,
-            }
-        )
-        print(f"{filename}: {speaker_id}")
+    media_temp = None
+    media_reader = None
+    try:
+        if media_path is not None:
+            if not media_path.exists():
+                raise SystemExit(f"Media file not found: {media_path}")
+            media_temp = tempfile.TemporaryDirectory()
+            wav_path = Path(media_temp.name) / "source.wav"
+            extract_audio(media_path, wav_path)
+            media_reader = wave.open(str(wav_path), "rb")
 
-    (output_dir / "sync.json").write_text(
-        json.dumps({"version": 1, "audio_clips": clips}, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    (output_dir / "speakers.json").write_text(
-        json.dumps(state["speakers"], ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    print(f"Wrote {len(clips)} clips to {output_dir}")
+        clips = []
+        for index, subtitle in enumerate(subtitles, 1):
+            clean_text = subtitle["text"]
+            if media_reader is not None:
+                features = analyze_subtitle(media_reader, clean_text, subtitle["start"], subtitle["end"])
+                speaker_id = choose_speaker_from_features(state, features, clean_text)
+            else:
+                speaker_id, clean_text = choose_speaker_from_text(state, clean_text)
+                features = {"pitch_hz": None, "speech_rate": round(len(re.findall(r"\w+", clean_text)) / max(0.1, subtitle["end"] - subtitle["start"]), 2), "bucket": fallback_type(clean_text) or "unknown"}
+
+            filename = f"clip_{index:03d}.m4a"
+            synthesize(clean_text, state["speakers"][speaker_id], output_dir / filename)
+            clips.append(
+                {
+                    "start": subtitle["start"],
+                    "end": subtitle["end"],
+                    "url": filename,
+                    "speaker_id": speaker_id,
+                    "text": clean_text,
+                    "pitch_hz": features["pitch_hz"],
+                    "speech_rate": features["speech_rate"],
+                    "bucket": features["bucket"],
+                    "dialect_hint": state["speakers"][speaker_id]["dialect_hint"],
+                }
+            )
+            print(f"{filename}: {speaker_id} ({features['bucket']})")
+
+        (output_dir / "sync.json").write_text(
+            json.dumps({"version": 1, "audio_clips": clips}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        (output_dir / "speakers.json").write_text(
+            json.dumps(state["speakers"], ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        print(f"Wrote {len(clips)} clips to {output_dir}")
+    finally:
+        if media_reader is not None:
+            media_reader.close()
+        if media_temp is not None:
+            media_temp.cleanup()
 
 
 if __name__ == "__main__":

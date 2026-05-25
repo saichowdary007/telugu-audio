@@ -31,6 +31,24 @@ Voice handling is simple by design:
 - Named subtitle lines like `Ravi: Hello` keep the same speaker profile across
   the file. Unnamed dialogue alternates automatically.
 
+### Automatic Speaker Detection
+
+If you also have the source movie or audio file, you can add `--media` and the
+script will use FFmpeg to extract the soundtrack, estimate pitch per subtitle
+interval, and cluster recurring speakers automatically:
+
+```bash
+python3 pipeline.py input.srt out --media movie.mp4
+```
+
+This is pitch-based voice typing:
+- low pitch usually maps to a male voice bucket
+- mid pitch maps to a female voice bucket
+- high pitch maps to a child-like bucket
+
+That is useful for automatic voice selection, but it is not true linguistic
+dialect detection. Pitch alone cannot reliably identify a spoken dialect.
+
 ## Auto Sync Extension
 
 The extension does not need manual offset tuning. It mutes the webpage video and
