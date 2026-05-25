@@ -2,13 +2,11 @@
 
 Tools for generating Telugu audio tracks and syncing them with browser video playback.
 
-## Python Pipeline
+## macOS Local Pipeline
 
-Generate Telugu MP3 clips and sync metadata from an `.srt` file:
+Generate local Telugu audio clips from an `.srt` file with built-in macOS speech:
 
 ```bash
-python3 -m pip install -r requirements.txt
-export GOOGLE_APPLICATION_CREDENTIALS=/path/to/google-cloud-key.json
 python3 pipeline.py input.srt out
 ```
 
@@ -16,36 +14,22 @@ Output:
 
 ```text
 out/
-  clip_001.mp3
-  clip_002.mp3
+  clip_001.m4a
+  clip_002.m4a
   sync.json
   speakers.json
 ```
 
-The script uses simple automatic speaker detection. Named subtitle lines like
-`Ravi: Hello` keep the same voice profile across the file. Unnamed dialogue
-alternates between two default speakers, and words like `woman`, `girl`,
-`father`, or `child` influence the voice type. Speaker differences are created
-with Google Telugu TTS voice selection plus pitch and speaking-rate changes.
+The pipeline uses macOS `say` and `afconvert`, so there is no external TTS
+service, no API key, and no Python dependency install step.
 
-### TTS Provider
-
-The pipeline supports two Google TTS paths:
-
-```bash
-# Higher free usage volume for standard voices
-TTS_PROVIDER=cloud python3 pipeline.py input.srt out
-
-# Gemini 3.1 Flash TTS preview
-TTS_PROVIDER=gemini GEMINI_API_KEY=... python3 pipeline.py input.srt out
-```
-
-For free-tier usage volume, Cloud Text-to-Speech standard voices currently have
-the larger free allowance. Gemini 3.1 Flash TTS is the newer controllable model,
-but its free-tier request limits are much tighter.
-
-If you pasted an API key into chat, rotate it and use an environment variable
-instead.
+Voice handling is simple by design:
+- It uses any Telugu voices installed on your Mac.
+- It assigns different speakers different local voice IDs when available.
+- If only one Telugu voice exists, it still separates characters using different
+  speaking rates so the audio does not sound identical.
+- Named subtitle lines like `Ravi: Hello` keep the same speaker profile across
+  the file. Unnamed dialogue alternates automatically.
 
 ## Auto Sync Extension
 
