@@ -11,7 +11,7 @@ from pathlib import Path
 
 import numpy as np
 
-from pipeline import discover_telugu_voices, estimate_pitch, parse_srt, read_segment, voice_rate
+from pipeline import discover_telugu_voices, parse_srt, read_segment, voice_rate
 
 
 def usage():
@@ -123,6 +123,36 @@ def spectral_embedding(samples, sr):
     return vec / norm if norm else vec
 
 
+def fast_pitch(samples, sr):
+    if len(samples) < sr // 5:
+        return None
+
+    arr = np.asarray(samples, dtype=np.float32)
+    arr = arr[: min(len(arr), int(sr * 1.6))]
+    arr = arr - np.mean(arr)
+    if np.sqrt(np.mean(arr * arr)) < 90:
+        return None
+
+    frame_size = max(320, int(sr * 0.04))
+    hop = max(320, int(sr * 0.04))
+    min_lag = max(1, int(sr / 400))
+    max_lag = max(min_lag + 1, int(sr / 60))
+    pitches = []
+
+    for offset in range(0, len(arr) - frame_size + 1, hop):
+        frame = arr[offset : offset + frame_size]
+        frame = frame - np.mean(frame)
+        energy = float(np.dot(frame, frame))
+        if energy < 1e6:
+            continue
+        scores = [float(np.dot(frame[:-lag], frame[lag:]) / energy) for lag in range(min_lag, max_lag + 1)]
+        best = int(np.argmax(scores))
+        if scores[best] > 0.25:
+            pitches.append(sr / (min_lag + best))
+
+    return round(float(np.median(pitches)), 1) if pitches else None
+
+
 def speaker_type(pitch_hz):
     if pitch_hz is None:
         return "unknown"
@@ -143,7 +173,7 @@ def build_segments(subtitles, reader, offset):
         start = max(0.0, sub["start"] + offset)
         end = max(start, sub["end"] + offset)
         samples, sr = read_segment(reader, start, end)
-        pitch = estimate_pitch(samples, sr)
+        pitch = fast_pitch(samples, sr)
         embedding = spectral_embedding(samples, sr)
         text = sub["text"]
         multi = bool(re.search(r"(^|\s)-\s*\w", text)) or text.count("- ") > 1
