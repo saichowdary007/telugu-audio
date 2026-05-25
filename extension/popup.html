@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+      body {
+        font: 13px/1.4 system-ui, sans-serif;
+        width: 320px;
+        margin: 0;
+        padding: 12px;
+      }
+      label, input, button { display: block; width: 100%; }
+      input { box-sizing: border-box; margin: 6px 0 10px; padding: 8px; }
+      button { padding: 8px; }
+      .hint { color: #555; font-size: 12px; margin-top: 8px; }
+    </style>
+  </head>
+  <body>
+    <label for="source">Sync package URL</label>
+    <input id="source" placeholder="http://localhost:8000/" />
+    <button id="save">Save</button>
+    <div class="hint">Serve the output folder and point this at the folder root.</div>
+    <script src="popup.js"></script>
+  </body>
+</html>

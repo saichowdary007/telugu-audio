@@ -3,12 +3,20 @@ import json
 import os
 import re
 import sys
+import wave
 from pathlib import Path
 
 try:
     from google.cloud import texttospeech
 except ImportError:
     texttospeech = None
+
+try:
+    from google import genai
+    from google.genai import types as genai_types
+except ImportError:
+    genai = None
+    genai_types = None
 
 
 TIME_RE = re.compile(
@@ -28,6 +36,13 @@ VOICE_SETTINGS = [
     ("child", "te-IN-Standard-A", 6.0, 1.12),
     ("elderly", "te-IN-Standard-B", -5.0, 0.86),
 ]
+
+GEMINI_VOICES = {
+    "adult_male": "Kore",
+    "adult_female": "Aoede",
+    "child": "Puck",
+    "elderly": "Charon",
+}
 
 
 def seconds(parts):
@@ -134,6 +149,11 @@ def voice_profile(speaker_id, speaker_type, index):
 
 
 def synthesize(client, text, profile, mp3_path):
+    provider = os.environ.get("TTS_PROVIDER", "cloud").strip().lower()
+    if provider == "gemini":
+        synthesize_gemini(client, text, profile, mp3_path)
+        return
+
     voice = texttospeech.VoiceSelectionParams(
         language_code=profile["language_code"],
         name=profile["voice_name"],
@@ -151,7 +171,39 @@ def synthesize(client, text, profile, mp3_path):
     mp3_path.write_bytes(response.audio_content)
 
 
-def require_tts():
+def synthesize_gemini(client, text, profile, wav_path):
+    voice_name = GEMINI_VOICES.get(profile["type"], "Kore")
+    response = client.models.generate_content(
+        model=os.environ.get("GEMINI_TTS_MODEL", "gemini-3.1-flash-tts-preview"),
+        contents=text,
+        config=genai_types.GenerateContentConfig(
+            response_modalities=["AUDIO"],
+            speech_config=genai_types.SpeechConfig(
+                voice_config=genai_types.VoiceConfig(
+                    prebuilt_voice_config=genai_types.PrebuiltVoiceConfig(
+                        voice_name=voice_name,
+                    )
+                )
+            ),
+        ),
+    )
+    pcm = response.candidates[0].content.parts[0].inline_data.data
+    with wave.open(str(wav_path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(24000)
+        wf.writeframes(pcm)
+
+
+def require_tts(provider):
+    if provider == "gemini":
+        if genai is None or genai_types is None:
+            raise SystemExit("Missing dependency. Run: python3 -m pip install -r requirements.txt")
+        api_key = os.environ.get("GEMINI_API_KEY")
+        if not api_key:
+            raise SystemExit("Missing GEMINI_API_KEY for Gemini TTS.")
+        return genai.Client(api_key=api_key)
+
     if texttospeech is None:
         raise SystemExit("Missing dependency. Run: python3 -m pip install -r requirements.txt")
     if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
@@ -166,6 +218,9 @@ def main(argv):
     input_path = Path(argv[1])
     output_dir = Path(argv[2])
     output_dir.mkdir(parents=True, exist_ok=True)
+    provider = os.environ.get("TTS_PROVIDER", "cloud").strip().lower()
+    if provider not in {"cloud", "gemini"}:
+        raise SystemExit("TTS_PROVIDER must be 'cloud' or 'gemini'")
 
     subtitles = parse_srt(input_path)
     if not subtitles:
@@ -180,11 +235,11 @@ def main(argv):
         "type_counts": {},
     }
     clips = []
-    client = require_tts()
+    client = require_tts(provider)
 
     for index, subtitle in enumerate(subtitles, 1):
         speaker_id, clean_text = speaker_for(subtitle["text"], state)
-        filename = f"clip_{index:03d}.mp3"
+        filename = f"clip_{index:03d}.{'wav' if provider == 'gemini' else 'mp3'}"
         synthesize(client, clean_text, state["speakers"][speaker_id], output_dir / filename)
         clips.append(
             {
