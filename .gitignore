@@ -1,7 +1,10 @@
 __pycache__/
 *.pyc
 .DS_Store
+.venv/
+pretrained_models/
 out/
 out-sample/
 shutter-alt-sample/
 shutter-alt-sample2/
+telugu-only/

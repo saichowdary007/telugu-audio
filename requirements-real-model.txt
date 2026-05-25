@@ -1,0 +1,7 @@
+numpy
+torch
+torchaudio
+speechbrain
+transformers
+sentencepiece
+safetensors

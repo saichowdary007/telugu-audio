@@ -17,7 +17,7 @@ from pipeline import discover_telugu_voices, parse_srt, read_segment, voice_rate
 def usage():
     raise SystemExit(
         "Usage: python3 speaker_cluster.py input.srt source_audio_or_video output_dir "
-        "[--max-speakers N] [--offset SECONDS]"
+        "[--max-speakers N] [--offset SECONDS] [--embedding-model speechbrain|spectral]"
     )
 
 
@@ -29,6 +29,7 @@ def parse_args(argv):
     output_dir = Path(argv[3])
     max_speakers = None
     offset = 0.0
+    embedding_model = "speechbrain"
     extra = argv[4:]
     i = 0
     while i < len(extra):
@@ -38,9 +39,14 @@ def parse_args(argv):
         elif extra[i] == "--offset" and i + 1 < len(extra):
             offset = float(extra[i + 1])
             i += 2
+        elif extra[i] == "--embedding-model" and i + 1 < len(extra):
+            embedding_model = extra[i + 1]
+            if embedding_model not in {"speechbrain", "spectral"}:
+                usage()
+            i += 2
         else:
             usage()
-    return srt_path, media_path, output_dir, max_speakers, offset
+    return srt_path, media_path, output_dir, max_speakers, offset, embedding_model
 
 
 def run_ffmpeg(args):
@@ -48,24 +54,7 @@ def run_ffmpeg(args):
 
 
 def extract_dialogue_audio(media_path, wav_path):
-    center_cmd = [
-        "ffmpeg",
-        "-loglevel",
-        "error",
-        "-y",
-        "-i",
-        str(media_path),
-        "-af",
-        "pan=mono|c0=FC",
-        "-ar",
-        "16000",
-        "-vn",
-        str(wav_path),
-    ]
-    if run_ffmpeg(center_cmd).returncode == 0:
-        return "center"
-
-    mono_cmd = [
+    cmd = [
         "ffmpeg",
         "-loglevel",
         "error",
@@ -79,7 +68,7 @@ def extract_dialogue_audio(media_path, wav_path):
         "-vn",
         str(wav_path),
     ]
-    if run_ffmpeg(mono_cmd).returncode == 0:
+    if run_ffmpeg(cmd).returncode == 0:
         return "mono"
     raise SystemExit(f"Could not extract audio from {media_path}")
 
@@ -121,6 +110,50 @@ def spectral_embedding(samples, sr):
     vec = (vec - np.mean(vec)) / (np.std(vec) + 1e-6)
     norm = np.linalg.norm(vec)
     return vec / norm if norm else vec
+
+
+class SpeechBrainEmbeddingModel:
+    def __init__(self):
+        try:
+            import torch
+            from speechbrain.inference.classifiers import EncoderClassifier
+        except ImportError as exc:
+            raise SystemExit(
+                "SpeechBrain embeddings need the real-model dependencies. Install with:\n"
+                "  /opt/homebrew/bin/python3.12 -m venv .venv\n"
+                "  .venv/bin/pip install -r requirements-real-model.txt\n"
+                "Then run with .venv/bin/python."
+            ) from exc
+
+        self.torch = torch
+        self.classifier = EncoderClassifier.from_hparams(
+            source="speechbrain/spkrec-ecapa-voxceleb",
+            savedir="pretrained_models/spkrec-ecapa-voxceleb",
+        )
+        self.classifier.eval()
+
+    def __call__(self, samples, sr):
+        if len(samples) < int(sr * 0.5) or rms(samples) < 90:
+            return None
+        arr = np.asarray(samples, dtype=np.float32) / 32768.0
+        max_samples = int(sr * 8.0)
+        if len(arr) > max_samples:
+            trim = (len(arr) - max_samples) // 2
+            arr = arr[trim : trim + max_samples]
+        signal = self.torch.from_numpy(arr).unsqueeze(0)
+        with self.torch.no_grad():
+            embedding = self.classifier.encode_batch(signal).squeeze().detach().cpu().numpy()
+        norm = np.linalg.norm(embedding)
+        return embedding / norm if norm else embedding
+
+
+def build_embedding_extractor(name):
+    if name == "spectral":
+        return spectral_embedding, "spectral"
+    if name == "speechbrain":
+        model = SpeechBrainEmbeddingModel()
+        return model, "speechbrain/spkrec-ecapa-voxceleb"
+    raise SystemExit(f"Unsupported embedding model: {name}")
 
 
 def fast_pitch(samples, sr):
@@ -167,14 +200,14 @@ def cosine_distance(a, b):
     return float(1.0 - np.clip(np.dot(a, b), -1.0, 1.0))
 
 
-def build_segments(subtitles, reader, offset):
+def build_segments(subtitles, reader, offset, embedding_extractor):
     segments = []
     for line_id, sub in enumerate(subtitles, 1):
         start = max(0.0, sub["start"] + offset)
         end = max(start, sub["end"] + offset)
         samples, sr = read_segment(reader, start, end)
         pitch = fast_pitch(samples, sr)
-        embedding = spectral_embedding(samples, sr)
+        embedding = embedding_extractor(samples, sr)
         text = sub["text"]
         multi = bool(re.search(r"(^|\s)-\s*\w", text)) or text.count("- ") > 1
         duration = sub["end"] - sub["start"]
@@ -383,17 +416,19 @@ def word_count(text):
 
 
 def main(argv):
-    srt_path, media_path, output_dir, max_speakers, offset = parse_args(argv)
+    srt_path, media_path, output_dir, max_speakers, offset, embedding_model = parse_args(argv)
     output_dir.mkdir(parents=True, exist_ok=True)
     subtitles = parse_srt(srt_path)
     if not subtitles:
         raise SystemExit(f"No subtitles found in {srt_path}")
 
+    embedding_extractor, embedding_model_used = build_embedding_extractor(embedding_model)
+
     with tempfile.TemporaryDirectory() as tmpdir:
         wav_path = Path(tmpdir) / "dialogue.wav"
         mode = extract_dialogue_audio(media_path, wav_path)
         with wave.open(str(wav_path), "rb") as reader:
-            segments = build_segments(subtitles, reader, offset)
+            segments = build_segments(subtitles, reader, offset, embedding_extractor)
 
     clusters = cluster_segments(segments, max_speakers)
     if not clusters:
@@ -403,6 +438,7 @@ def main(argv):
     (output_dir / "speakers.json").write_text(json.dumps(speakers, ensure_ascii=False, indent=2), encoding="utf-8")
     (output_dir / "line_speaker_map.json").write_text(json.dumps(line_map, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"Audio extraction: {mode}")
+    print(f"Embedding model: {embedding_model_used}")
     print(f"Subtitles: {len(subtitles)}")
     print(f"Speakers: {len(speakers)}")
     print(f"Wrote {output_dir / 'speakers.json'}")

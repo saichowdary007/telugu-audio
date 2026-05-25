@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import json
+import math
 import re
 import statistics
 import struct
@@ -26,7 +27,8 @@ BASE_RATE = {"adult_male": 152, "adult_female": 176, "child": 210, "elderly": 13
 def usage():
     raise SystemExit(
         "Usage: python3 pipeline.py input.srt output_dir [--media movie.mp4] "
-        "[--speaker-map line_speaker_map.json] [--speakers speakers.json] [--dry-run]"
+        "[--speaker-map line_speaker_map.json] [--speakers speakers.json] "
+        "[--tts-engine macos|mms] [--single-only] [--dry-run]"
     )
 
 
@@ -36,6 +38,8 @@ def parse_args(argv):
     media = None
     speaker_map = None
     speakers_path = None
+    tts_engine = "macos"
+    single_only = False
     dry_run = False
     extra = argv[3:]
     i = 0
@@ -49,12 +53,20 @@ def parse_args(argv):
         elif extra[i] == "--speakers" and i + 1 < len(extra):
             speakers_path = Path(extra[i + 1])
             i += 2
+        elif extra[i] == "--tts-engine" and i + 1 < len(extra):
+            tts_engine = extra[i + 1]
+            if tts_engine not in {"macos", "mms"}:
+                usage()
+            i += 2
+        elif extra[i] == "--single-only":
+            single_only = True
+            i += 1
         elif extra[i] == "--dry-run":
             dry_run = True
             i += 1
         else:
             usage()
-    return Path(argv[1]), Path(argv[2]), media, speaker_map, speakers_path, dry_run
+    return Path(argv[1]), Path(argv[2]), media, speaker_map, speakers_path, tts_engine, single_only, dry_run
 
 
 def seconds(parts):
@@ -333,10 +345,313 @@ def synthesize(text, profile, out_path):
         subprocess.run(["afconvert", "-f", "m4af", "-d", "aac", str(aiff), str(out_path)], check=True)
 
 
+class MmsTeluguSynthesizer:
+    def __init__(self):
+        try:
+            import numpy as np
+            import torch
+            from transformers import AutoTokenizer, VitsModel
+        except ImportError as exc:
+            raise SystemExit(
+                "MMS Telugu TTS needs the real-model dependencies. Install with:\n"
+                "  /opt/homebrew/bin/python3.12 -m venv .venv\n"
+                "  .venv/bin/pip install -r requirements-real-model.txt\n"
+                "Then run with .venv/bin/python."
+            ) from exc
+
+        self.np = np
+        self.torch = torch
+        self.tokenizer = AutoTokenizer.from_pretrained("facebook/mms-tts-tel")
+        self.model = VitsModel.from_pretrained("facebook/mms-tts-tel")
+        self.model.eval()
+        self.sample_rate = int(self.model.config.sampling_rate)
+
+    def normalize_text(self, text):
+        text = text.replace("...", ".")
+        return re.sub(r"[A-Za-z][A-Za-z'_-]*", lambda match: self.latin_word_to_telugu(match.group(0)), text)
+
+    def latin_word_to_telugu(self, word):
+        known = {
+            "andrew": "ఆండ్రూ",
+            "boss": "బాస్",
+            "chuck": "చక్",
+            "daniels": "డేనియల్స్",
+            "dolores": "డొలోరెస్",
+            "george": "జార్జ్",
+            "laeddis": "లేడిస్",
+            "portland": "పోర్ట్ ల్యాండ్",
+            "rachel": "రేచెల్",
+            "teddy": "టెడ్డీ",
+        }
+        key = re.sub(r"[^a-z]", "", word.lower())
+        if key in known:
+            return known[key]
+
+        consonants = {
+            "b": "బ",
+            "c": "క",
+            "d": "డ",
+            "f": "ఫ",
+            "g": "గ",
+            "h": "హ",
+            "j": "జ",
+            "k": "క",
+            "l": "ల",
+            "m": "మ",
+            "n": "న",
+            "p": "ప",
+            "q": "క",
+            "r": "ర",
+            "s": "స",
+            "t": "ట",
+            "v": "వ",
+            "w": "వ",
+            "x": "క్స్",
+            "y": "య",
+            "z": "జ",
+        }
+        clusters = {
+            "ch": "చ",
+            "sh": "ష",
+            "th": "త",
+            "dh": "ద",
+            "ph": "ఫ",
+            "bh": "భ",
+            "kh": "ఖ",
+            "gh": "ఘ",
+        }
+        vowels = {
+            "a": "",
+            "e": "ె",
+            "i": "ి",
+            "o": "ొ",
+            "u": "ు",
+            "aa": "ా",
+            "ee": "ీ",
+            "ii": "ీ",
+            "oo": "ూ",
+            "uu": "ూ",
+            "ai": "ై",
+            "au": "ౌ",
+        }
+        independent_vowels = {
+            "a": "అ",
+            "e": "ఎ",
+            "i": "ఇ",
+            "o": "ఒ",
+            "u": "ఉ",
+            "aa": "ఆ",
+            "ee": "ఈ",
+            "ii": "ఈ",
+            "oo": "ఊ",
+            "uu": "ఊ",
+            "ai": "ఐ",
+            "au": "ఔ",
+        }
+
+        result = []
+        i = 0
+        while i < len(key):
+            vowel = next((v for v in ("aa", "ee", "ii", "oo", "uu", "ai", "au") if key.startswith(v, i)), None)
+            if vowel or key[i] in "aeiou":
+                vowel = vowel or key[i]
+                result.append(independent_vowels[vowel])
+                i += len(vowel)
+                continue
+
+            cluster = next((c for c in ("ch", "sh", "th", "dh", "ph", "bh", "kh", "gh") if key.startswith(c, i)), None)
+            base = clusters.get(cluster) if cluster else consonants.get(key[i])
+            i += len(cluster) if cluster else 1
+            if not base:
+                continue
+            vowel = next((v for v in ("aa", "ee", "ii", "oo", "uu", "ai", "au") if key.startswith(v, i)), None)
+            if vowel or (i < len(key) and key[i] in "aeiou"):
+                vowel = vowel or key[i]
+                result.append(base + vowels[vowel])
+                i += len(vowel)
+            else:
+                result.append(base)
+        return "".join(result) or word
+
+    def text_chunks(self, text, max_chars=110):
+        text = self.normalize_text(text)
+        text = re.sub(r"\s+", " ", text).strip()
+        parts = [part.strip() for part in re.split(r"([.?!।॥,;:]+)", text) if part.strip()]
+        merged = []
+        pending = ""
+        for part in parts:
+            if re.fullmatch(r"[.?!।॥,;:]+", part) and pending:
+                pending += part
+                continue
+            if pending and len(pending) + len(part) + 1 > max_chars:
+                merged.append(pending)
+                pending = part
+            else:
+                pending = f"{pending} {part}".strip()
+        if pending:
+            merged.append(pending)
+
+        chunks = []
+        for part in merged or [text]:
+            if len(part) <= max_chars:
+                chunks.append(part)
+                continue
+            words = part.split()
+            pending = ""
+            for word in words:
+                if pending and len(pending) + len(word) + 1 > max_chars:
+                    chunks.append(pending)
+                    pending = word
+                else:
+                    pending = f"{pending} {word}".strip()
+            if pending:
+                chunks.append(pending)
+        return chunks or [text]
+
+    def render_waveform(self, text):
+        inputs = self.tokenizer(text, return_tensors="pt")
+        with self.torch.no_grad():
+            return self.model(**inputs).waveform.squeeze().detach().cpu().numpy()
+
+    def synthesize(self, text, profile, out_path):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            wav_path = tmpdir / "mms.wav"
+            shaped_wav = tmpdir / "mms_shaped.wav"
+            waveforms = []
+            pause = self.np.zeros(int(self.sample_rate * 0.08), dtype=self.np.float32)
+            for chunk in self.text_chunks(text):
+                try:
+                    chunk_waveform = self.render_waveform(chunk)
+                except Exception as exc:
+                    raise RuntimeError(f"MMS Telugu TTS failed for text chunk: {chunk!r}") from exc
+                waveforms.append(self.np.asarray(chunk_waveform, dtype=self.np.float32))
+                waveforms.append(pause)
+            waveform = self.np.concatenate(waveforms[:-1] if len(waveforms) > 1 else waveforms)
+            peak = float(self.np.max(self.np.abs(waveform))) or 1.0
+            pcm = self.np.clip(waveform / peak * 0.92, -1.0, 1.0)
+            pcm16 = (pcm * 32767).astype("<i2")
+            with wave.open(str(wav_path), "wb") as writer:
+                writer.setnchannels(1)
+                writer.setsampwidth(2)
+                writer.setframerate(self.sample_rate)
+                writer.writeframes(pcm16.tobytes())
+
+            speed = max(0.80, min(1.25, float(profile.get("rate", 160)) / 160.0))
+            semitone = {"adult_male": -1.6, "adult_female": 0.8, "child": 2.0}.get(profile.get("type"), 0.0)
+            pitch_factor = math.pow(2.0, semitone / 12.0)
+            shaped_rate = max(8000, int(round(self.sample_rate * pitch_factor)))
+            subprocess.run(
+                [
+                    "ffmpeg",
+                    "-loglevel",
+                    "error",
+                    "-y",
+                    "-i",
+                    str(wav_path),
+                    "-af",
+                    f"asetrate={shaped_rate},aresample={self.sample_rate},atempo={speed:.4f}",
+                    "-c:a",
+                    "pcm_s16le",
+                    str(shaped_wav),
+                ],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            subprocess.run(
+                ["ffmpeg", "-loglevel", "error", "-y", "-i", str(shaped_wav), "-c:a", "aac", str(out_path)],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+
+def build_synthesizer(engine):
+    if engine == "mms":
+        return MmsTeluguSynthesizer().synthesize
+    return synthesize
+
+
 def render_single_track(clips, output_dir, final_path, total_duration=None):
     if not clips:
         return
 
+    if len(clips) > 120:
+        render_single_track_concat(clips, output_dir, final_path, total_duration)
+        return
+
+    clip_paths = []
+    rendered_end = clips[-1]["end"]
+    for clip in clips:
+        clip_path = Path(clip.get("path", output_dir / clip["url"]))
+        clip_paths.append(clip_path)
+        try:
+            rendered_end = max(rendered_end, max(0.0, clip["start"]) + probe_duration(clip_path))
+        except Exception:
+            pass
+
+    duration = max(total_duration or 0.0, rendered_end, 0.1)
+    inputs = [
+        "ffmpeg",
+        "-loglevel",
+        "error",
+        "-y",
+        "-f",
+        "lavfi",
+        "-t",
+        f"{duration:.3f}",
+        "-i",
+        "anullsrc=r=16000:cl=mono",
+    ]
+    for clip_path in clip_paths:
+        inputs.extend(["-i", str(clip_path)])
+
+    filters = ["[0:a]volume=0[base]"]
+    mix_inputs = ["[base]"]
+    for index, clip in enumerate(clips, 1):
+        delay_ms = max(0, int(round(max(0.0, clip["start"]) * 1000)))
+        label = f"clip{index}"
+        filters.append(f"[{index}:a]adelay={delay_ms}:all=1[{label}]")
+        mix_inputs.append(f"[{label}]")
+    filters.append(
+        f"{''.join(mix_inputs)}amix=inputs={len(mix_inputs)}:duration=first:normalize=0,"
+        "alimiter=limit=0.95[a]"
+    )
+
+    subprocess.run(
+        inputs
+        + [
+            "-filter_complex",
+            ";".join(filters),
+            "-map",
+            "[a]",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-movflags",
+            "+faststart",
+            str(final_path),
+        ],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def extract_background_track(media_path, background_path):
+    base_cmd = ["ffmpeg", "-loglevel", "error", "-y", "-i", str(media_path), "-map", "0:a:0", "-vn"]
+    subprocess.run(
+        base_cmd + ["-ac", "2", "-c:a", "aac", "-b:a", "192k", str(background_path)],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return True
+
+
+def render_single_track_concat(clips, output_dir, final_path, total_duration=None):
     duration = total_duration if total_duration is not None else clips[-1]["end"]
     silence = output_dir / "_silence.wav"
     subprocess.run(
@@ -348,7 +663,7 @@ def render_single_track(clips, output_dir, final_path, total_duration=None):
             "-f",
             "lavfi",
             "-i",
-            f"anullsrc=r=16000:cl=mono",
+            "anullsrc=r=16000:cl=mono",
             "-t",
             f"{max(duration, 0.1):.3f}",
             "-c:a",
@@ -362,28 +677,21 @@ def render_single_track(clips, output_dir, final_path, total_duration=None):
     lines = []
     cursor = 0.0
     for clip in clips:
+        clip_path = Path(clip.get("path", output_dir / clip["url"]))
         start = max(0.0, clip["start"])
         if start > cursor:
             gap = start - cursor
-            lines.extend(
-                [
-                    f"file '{silence.as_posix()}'",
-                    "inpoint 0",
-                    f"outpoint {gap:.3f}",
-                ]
-            )
-        lines.append(f"file '{(output_dir / clip['url']).as_posix()}'")
-        cursor = max(cursor, clip["end"])
+            lines.extend([f"file '{silence.as_posix()}'", "inpoint 0", f"outpoint {gap:.3f}"])
+            cursor = start
+        lines.append(f"file '{clip_path.as_posix()}'")
+        try:
+            cursor += probe_duration(clip_path)
+        except Exception:
+            cursor = max(cursor, clip["end"])
 
     if duration > cursor:
         gap = duration - cursor
-        lines.extend(
-            [
-                f"file '{silence.as_posix()}'",
-                "inpoint 0",
-                f"outpoint {gap:.3f}",
-            ]
-        )
+        lines.extend([f"file '{silence.as_posix()}'", "inpoint 0", f"outpoint {gap:.3f}"])
 
     list_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
     subprocess.run(
@@ -398,8 +706,12 @@ def render_single_track(clips, output_dir, final_path, total_duration=None):
             "0",
             "-i",
             str(list_file),
+            "-ac",
+            "2",
             "-c:a",
             "aac",
+            "-b:a",
+            "192k",
             "-movflags",
             "+faststart",
             str(final_path),
@@ -410,32 +722,9 @@ def render_single_track(clips, output_dir, final_path, total_duration=None):
     )
 
 
-def extract_background_track(media_path, background_path):
-    # Prefer 5.1 sources: keep L/R/surround/LFE and drop the center dialogue channel.
-    centerless_pan = "pan=stereo|FL=0.50*FL+0.50*BL+0.25*LFE|FR=0.50*FR+0.50*BR+0.25*LFE"
-    base_cmd = ["ffmpeg", "-loglevel", "error", "-y", "-i", str(media_path), "-map", "0:a:0", "-vn"]
-    try:
-        subprocess.run(
-            base_cmd + ["-af", centerless_pan, "-c:a", "aac", "-b:a", "192k", str(background_path)],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        return True
-    except subprocess.CalledProcessError:
-        subprocess.run(
-            base_cmd + ["-ac", "2", "-af", "volume=0.35", "-c:a", "aac", "-b:a", "192k", str(background_path)],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        return False
-
-
 def mix_dubbed_track(background_path, voice_path, final_path, center_removed):
-    bg_volume = "0.65" if center_removed else "0.45"
     filter_graph = (
-        f"[0:a]volume={bg_volume}[bg];"
+        "[0:a]volume=0.65[bg];"
         "[1:a]volume=1.0[voice];"
         "[bg][voice]amix=inputs=2:duration=longest:dropout_transition=0,"
         "alimiter=limit=0.95[a]"
@@ -487,13 +776,14 @@ def load_speaker_outputs(speaker_map_path, speakers_path):
 
 
 def main(argv):
-    input_path, output_dir, media_path, speaker_map_path, speakers_path, dry_run = parse_args(argv)
+    input_path, output_dir, media_path, speaker_map_path, speakers_path, tts_engine, single_only, dry_run = parse_args(argv)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     subtitles = parse_srt(input_path)
     if not subtitles:
         raise SystemExit(f"No subtitles found in {input_path}")
 
+    synthesize_clip = build_synthesizer(tts_engine) if not dry_run else None
     mapped_lines, mapped_speakers = load_speaker_outputs(speaker_map_path, speakers_path)
     state = {
         "speakers": {},
@@ -511,6 +801,7 @@ def main(argv):
 
     media_temp = None
     media_reader = None
+    clip_temp = None
     total_duration = None
     try:
         if media_path is not None:
@@ -528,12 +819,15 @@ def main(argv):
                 print(f"warning: could not extract audio from {media_path}; falling back to subtitle-only speaker heuristics", file=sys.stderr)
 
         clips = []
+        clip_output_dir = output_dir
+        if single_only and not dry_run:
+            clip_temp = tempfile.TemporaryDirectory()
+            clip_output_dir = Path(clip_temp.name)
         for index, subtitle in enumerate(subtitles, 1):
             clean_text = subtitle["text"]
             if mapped_lines and index in mapped_lines:
                 mapped = mapped_lines[index]
                 speaker_id = mapped["speaker_id"]
-                clean_text = mapped.get("text", clean_text)
                 if speaker_id not in state["speakers"]:
                     state["speakers"][speaker_id] = {
                         "label": speaker_id,
@@ -560,12 +854,13 @@ def main(argv):
 
             filename = f"clip_{index:03d}.m4a"
             if not dry_run:
-                synthesize(clean_text, state["speakers"][speaker_id], output_dir / filename)
+                synthesize_clip(clean_text, state["speakers"][speaker_id], clip_output_dir / filename)
             clips.append(
                 {
                     "start": subtitle["start"],
                     "end": subtitle["end"],
                     "url": filename,
+                    "path": str(clip_output_dir / filename),
                     "speaker_id": speaker_id,
                     "text": clean_text,
                     "pitch_hz": features["pitch_hz"],
@@ -576,8 +871,9 @@ def main(argv):
             )
             print(f"{filename}: {speaker_id} ({features['bucket']})")
 
+        sync_clips = [{k: v for k, v in clip.items() if k != "path"} for clip in clips]
         (output_dir / "sync.json").write_text(
-            json.dumps({"version": 1, "audio_clips": clips}, ensure_ascii=False, indent=2),
+            json.dumps({"version": 1, "audio_clips": sync_clips}, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
         (output_dir / "speakers.json").write_text(
@@ -589,9 +885,10 @@ def main(argv):
             render_single_track(clips, output_dir, final_path, total_duration)
             if media_path is not None:
                 dubbed_path, center_removed = render_dubbed_track(media_path, final_path, output_dir)
-                if not center_removed:
-                    print("warning: source did not expose a 5.1 center channel; used quieter stereo background", file=sys.stderr)
-        print(f"Wrote {len(clips)} clips to {output_dir}")
+        if single_only:
+            print(f"Rendered {len(clips)} temporary clips")
+        else:
+            print(f"Wrote {len(clips)} clips to {output_dir}")
         if not dry_run:
             print(f"Wrote single track to {final_path}")
             if media_path is not None:
@@ -601,6 +898,8 @@ def main(argv):
             media_reader.close()
         if media_temp is not None:
             media_temp.cleanup()
+        if clip_temp is not None:
+            clip_temp.cleanup()
 
 
 if __name__ == "__main__":

@@ -10,6 +10,54 @@ Generate local Telugu audio clips from an `.srt` file with built-in macOS speech
 python3 pipeline.py input.srt out
 ```
 
+For the real full-movie pipeline with open-source models, use Python 3.12 and
+install the model dependencies:
+
+```bash
+/opt/homebrew/bin/python3.12 -m venv .venv
+.venv/bin/pip install -r requirements-real-model.txt
+```
+
+Then run the end-to-end command with the original media or audio, original
+matching SRT, and Telugu translated SRT:
+
+```bash
+.venv/bin/python run_full_movie.py \
+  --media movie.mkv \
+  --source-srt original.srt \
+  --telugu-srt telugu.srt \
+  --out full-dub \
+  --embedding-model speechbrain \
+  --tts-engine mms
+```
+
+That produces:
+
+```text
+full-dub/
+  speaker-clusters/
+    speakers.json
+    line_speaker_map.json
+  dub/
+    single-track.m4a
+    telugu_dub_track.m4a
+    sync.json
+    speakers.json
+```
+
+`telugu_dub_track.m4a` is the file to use for the movie: it mixes the original
+background track with the generated Telugu speech timeline. The command refuses
+to run when the Telugu SRT is clearly only a short sample, because the final dub
+must match the full media duration. Mono inputs are converted to stereo so the
+final track plays through both left and right speakers.
+
+If you only want the final Telugu audio track and do not want the individual
+subtitle clips in the output folder, run:
+
+```bash
+python3 pipeline.py input.srt out --single-only
+```
+
 Output:
 
 ```text
@@ -39,19 +87,23 @@ Voice handling is simple by design:
 - Named subtitle lines like `Ravi: Hello` keep the same speaker profile across
   the file. Unnamed dialogue alternates automatically.
 - The pipeline also stitches a single `single-track.m4a` that follows the
-  subtitle timeline, so you can listen to one file instead of many clips.
+  subtitle timeline, so you can listen to one file instead of many clips. It
+  places each Telugu line at its subtitle timestamp instead of concatenating
+  clips, so generated line lengths do not shift later dialogue out of sync.
 - When `--media` is provided, it also writes `telugu_dub_track.m4a`, which
   mixes the Telugu timeline voice over the original background.
+- `--tts-engine mms` uses Meta MMS Telugu TTS (`facebook/mms-tts-tel`) through
+  Transformers. `--tts-engine macos` keeps the older built-in macOS `say` path.
 
 ### Automatic Speaker Detection
 
-For stable speaker IDs, run the clustering step first. It extracts the center
-channel when available, builds a small acoustic embedding for each subtitle
-window, clusters similar voices, and writes `speakers.json` plus
+For stable speaker IDs, run the clustering step first. It extracts mono analysis
+audio from the source, builds a speaker embedding for each subtitle window,
+clusters similar voices, and writes `speakers.json` plus
 `line_speaker_map.json`:
 
 ```bash
-python3 speaker_cluster.py input.srt movie_or_audio.mkv cluster-out
+python3 speaker_cluster.py input.srt movie_or_audio.mkv cluster-out --embedding-model speechbrain
 ```
 
 Then generate Telugu audio with the stable speaker map:
@@ -68,13 +120,17 @@ That two-command flow covers the three offline phases:
 - Phase 3: when `--media` is passed, `pipeline.py` mixes that Telugu timeline
   with the original background and writes `telugu_dub_track.m4a`.
 
-For 5.1 audio, the mix removes the center dialogue channel and keeps the
-background channels. For stereo audio, true center removal is not reliable, so
-the script falls back to a quieter stereo background.
+The final mix keeps the source audio as the background bed, converts it to
+stereo when needed, and overlays the Telugu speech timeline.
 
 This local clustering is lightweight. It uses acoustic embeddings plus pitch,
 not actor names. Pitch is only used to choose adult male, adult female, or child
 voice type.
+
+With `--embedding-model speechbrain`, clustering uses the open-source
+SpeechBrain ECAPA speaker-recognition model (`speechbrain/spkrec-ecapa-voxceleb`)
+for real speaker embeddings. The production runner does not use fallback
+embeddings or fallback TTS.
 
 You can still pass `--media` directly to `pipeline.py`, but without the
 speaker map that path is the older pitch-only shortcut:
