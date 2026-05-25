@@ -16,6 +16,7 @@ Output:
 out/
   clip_001.m4a
   clip_002.m4a
+  single-track.m4a
   sync.json
   speakers.json
 ```
@@ -30,6 +31,8 @@ Voice handling is simple by design:
   speaking rates so the audio does not sound identical.
 - Named subtitle lines like `Ravi: Hello` keep the same speaker profile across
   the file. Unnamed dialogue alternates automatically.
+- The pipeline also stitches a single `single-track.m4a` that follows the
+  subtitle timeline, so you can listen to one file instead of many clips.
 
 ### Automatic Speaker Detection
 

@@ -128,6 +128,25 @@ def extract_audio(media_path, wav_path):
         return False
 
 
+def probe_duration(path):
+    proc = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(path),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return float(proc.stdout.strip())
+
+
 def read_segment(reader, start, end):
     sr = reader.getframerate()
     start_frame = max(0, int(start * sr))
@@ -303,6 +322,83 @@ def synthesize(text, profile, out_path):
         subprocess.run(["afconvert", "-f", "m4af", "-d", "aac", str(aiff), str(out_path)], check=True)
 
 
+def render_single_track(clips, output_dir, final_path, total_duration=None):
+    if not clips:
+        return
+
+    duration = total_duration if total_duration is not None else clips[-1]["end"]
+    silence = output_dir / "_silence.wav"
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            f"anullsrc=r=16000:cl=mono",
+            "-t",
+            f"{max(duration, 0.1):.3f}",
+            "-c:a",
+            "pcm_s16le",
+            str(silence),
+        ],
+        check=True,
+    )
+
+    list_file = output_dir / "_concat.txt"
+    lines = []
+    cursor = 0.0
+    for clip in clips:
+        start = max(0.0, clip["start"])
+        if start > cursor:
+            gap = start - cursor
+            lines.extend(
+                [
+                    f"file '{silence.as_posix()}'",
+                    "inpoint 0",
+                    f"outpoint {gap:.3f}",
+                ]
+            )
+        lines.append(f"file '{(output_dir / clip['url']).as_posix()}'")
+        cursor = max(cursor, clip["end"])
+
+    if duration > cursor:
+        gap = duration - cursor
+        lines.extend(
+            [
+                f"file '{silence.as_posix()}'",
+                "inpoint 0",
+                f"outpoint {gap:.3f}",
+            ]
+        )
+
+    list_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(list_file),
+            "-c:a",
+            "aac",
+            "-movflags",
+            "+faststart",
+            str(final_path),
+        ],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
 def main(argv):
     input_path, output_dir, media_path, dry_run = parse_args(argv)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -325,10 +421,15 @@ def main(argv):
 
     media_temp = None
     media_reader = None
+    total_duration = None
     try:
         if media_path is not None:
             if not media_path.exists():
                 raise SystemExit(f"Media file not found: {media_path}")
+            try:
+                total_duration = probe_duration(media_path)
+            except Exception:
+                total_duration = None
             media_temp = tempfile.TemporaryDirectory()
             wav_path = Path(media_temp.name) / "source.wav"
             if extract_audio(media_path, wav_path):
@@ -372,7 +473,10 @@ def main(argv):
             json.dumps(state["speakers"], ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+        final_path = output_dir / "single-track.m4a"
+        render_single_track(clips, output_dir, final_path, total_duration)
         print(f"Wrote {len(clips)} clips to {output_dir}")
+        print(f"Wrote single track to {final_path}")
     finally:
         if media_reader is not None:
             media_reader.close()
