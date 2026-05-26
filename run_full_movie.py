@@ -5,23 +5,77 @@ import subprocess
 import sys
 from pathlib import Path
 
-from pipeline import parse_srt, probe_duration
+from pipeline import extract_no_vocals_track, parse_srt, probe_duration, resolve_media
 
 ROOT = Path(__file__).resolve().parent
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Run the full Telugu dub pipeline end to end.")
-    parser.add_argument("--media", required=True, help="Original movie or audio file")
+    parser.add_argument(
+        "--media",
+        required=True,
+        help=(
+            "Original movie or audio file. Accepts video containers (mkv/mp4/webm/mov/...) "
+            "or audio-only files (mp3/m4a/wav/flac/...). If the given path is missing, "
+            "the runner falls back to sibling files with the same stem and any supported "
+            "extension (so .mkv and .mp3 are interchangeable for the same title)."
+        ),
+    )
     parser.add_argument("--source-srt", required=True, help="SRT matching the original audio for speaker clustering")
     parser.add_argument("--telugu-srt", required=True, help="Translated Telugu SRT used for TTS")
     parser.add_argument("--out", required=True, help="Output directory")
     parser.add_argument("--max-speakers", type=int, default=24)
     parser.add_argument("--offset", type=float, default=0.0)
     parser.add_argument("--embedding-model", default="speechbrain", choices=["speechbrain"])
-    parser.add_argument("--tts-engine", default="mms", choices=["mms"])
+    parser.add_argument(
+        "--tts-engine",
+        default="omnivoice",
+        choices=["omnivoice", "mms", "macos"],
+        help="Telugu TTS engine. omnivoice = k2-fsa/OmniVoice diffusion TTS (multi-voice).",
+    )
+    parser.add_argument(
+        "--tts-device",
+        default="auto",
+        choices=["auto", "mps", "cuda", "cpu"],
+        help="Device for the TTS model. auto = cuda > mps > cpu.",
+    )
+    parser.add_argument(
+        "--tts-num-step",
+        type=int,
+        default=16,
+        help=(
+            "OmniVoice diffusion denoising steps per clip. Lower = faster, slightly less polished. "
+            "16 (default) is the sweet spot for movie dubbing on Apple Silicon; 32 = OmniVoice default."
+        ),
+    )
+    parser.add_argument(
+        "--demucs-device",
+        default="auto",
+        choices=["auto", "mps", "cuda", "cpu"],
+        help="Device for Demucs vocal separation. auto picks the best available.",
+    )
+    parser.add_argument(
+        "--skip-demucs",
+        action="store_true",
+        help="DEBUG only: skip vocal separation. English speech will bleed through.",
+    )
     parser.add_argument("--keep-clips", action="store_true", help="Keep per-line generated clips")
     return parser.parse_args()
+
+
+def resolve_device(name):
+    if name != "auto":
+        return name
+    try:
+        import torch
+    except ImportError:
+        return "cpu"
+    if torch.cuda.is_available():
+        return "cuda"
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
 
 
 def require_file(path, label):
@@ -31,6 +85,12 @@ def require_file(path, label):
     if path.stat().st_size == 0:
         raise SystemExit(f"{label} is empty: {path}")
     return path
+
+
+def require_media(path):
+    """Resolve ``--media`` accepting either video or audio containers interchangeably."""
+    resolved = resolve_media(path)
+    return require_file(resolved, "media")
 
 
 def run(cmd):
@@ -63,13 +123,15 @@ def media_audio_info(path):
 
 def main():
     args = parse_args()
-    media = require_file(args.media, "media")
+    media = require_media(args.media)
     source_srt = require_file(args.source_srt, "source SRT")
     telugu_srt = require_file(args.telugu_srt, "Telugu SRT")
     out = Path(args.out)
     cluster_dir = out / "speaker-clusters"
     dub_dir = out / "dub"
+    background_dir = out / "background"
     out.mkdir(parents=True, exist_ok=True)
+    background_dir.mkdir(parents=True, exist_ok=True)
 
     source_lines = parse_srt(source_srt)
     telugu_lines = parse_srt(telugu_srt)
@@ -111,6 +173,15 @@ def main():
     cluster_cmd.extend(["--max-speakers", args.max_speakers])
     run(cluster_cmd)
 
+    no_vocals_path = background_dir / "no_vocals.wav"
+    if args.skip_demucs:
+        print("warning: --skip-demucs set, English speech will bleed through", flush=True)
+    else:
+        demucs_device = resolve_device(args.demucs_device)
+        print(f"Running Demucs vocal separation on {demucs_device} ...", flush=True)
+        extract_no_vocals_track(media, no_vocals_path, device=demucs_device)
+        print(f"Vocals removed -> {no_vocals_path}", flush=True)
+
     pipeline_cmd = [
         sys.executable,
         ROOT / "pipeline.py",
@@ -124,7 +195,13 @@ def main():
         cluster_dir / "speakers.json",
         "--tts-engine",
         args.tts_engine,
+        "--tts-device",
+        args.tts_device,
+        "--tts-num-step",
+        args.tts_num_step,
     ]
+    if not args.skip_demucs:
+        pipeline_cmd.extend(["--background", no_vocals_path])
     if not args.keep_clips:
         pipeline_cmd.append("--single-only")
     run(pipeline_cmd)

@@ -11,7 +11,7 @@ from pathlib import Path
 
 import numpy as np
 
-from pipeline import discover_telugu_voices, parse_srt, read_segment, voice_rate
+from pipeline import discover_telugu_voices, instruct_for_speaker, parse_srt, read_segment, voice_rate
 
 
 def usage():
@@ -376,12 +376,14 @@ def build_outputs(segments, clusters):
             detected_type = cluster["type"]
         speech_rate = avg((word_count(s["text"]) / max(0.1, s["end"] - s["start"]) for s in cluster["segments"]))
         speakers[speaker_id] = {
+            "label": speaker_id,
             "type": detected_type,
             "detected_type": detected_type,
             "avg_pitch_hz": avg_pitch,
             "segments": sorted(s["line_id"] for s in cluster["segments"]),
             "voice_name": voices[(idx - 1) % len(voices)],
             "rate": voice_rate(detected_type, speech_rate, idx - 1),
+            "instruct": instruct_for_speaker(detected_type, idx - 1),
             "confidence": confidence_for(cluster, clusters),
         }
 
@@ -399,6 +401,7 @@ def build_outputs(segments, clusters):
                 "voice_name": speaker.get("voice_name"),
                 "pitch_hz": seg["pitch_hz"],
                 "detected_type": speaker.get("detected_type", seg["type"]),
+                "instruct": speaker.get("instruct"),
                 "confidence": speaker.get("confidence", 0.2),
                 "multi_speaker_hint": seg["multi_speaker_hint"],
             }

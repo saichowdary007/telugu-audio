@@ -3,8 +3,30 @@ __pycache__/
 .DS_Store
 .venv/
 pretrained_models/
+
+# Pipeline output directories
 out/
 out-sample/
+shutter/
 shutter-alt-sample/
 shutter-alt-sample2/
 telugu-only/
+
+# Local source media (movies, audio tracks)
+*.mkv
+*.mp4
+*.webm
+*.mov
+*.m4v
+*.avi
+*.mp3
+*.m4a
+*.wav
+*.flac
+*.aac
+*.ogg
+*.opus
+
+# Pipeline caches
+.tts-cache/
+.demucs-cache/
